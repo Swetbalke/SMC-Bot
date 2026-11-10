@@ -15,11 +15,27 @@ from strategies.trade_levels import calculate_trade_levels
 from strategies.stop_manager import propose_trailing_stop
 
 
-def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
+TIMEFRAME_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "30m": 1800, "1h": 3600, "4h": 14400,
+}
+
+
+def prepare_historical_candles(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Validate and normalize OHLCV data before a performance backtest."""
     required = {"time", "open", "high", "low", "close"}
     if candles is None or candles.empty or not required.issubset(candles.columns):
         raise ValueError("Historical candles must contain time/open/high/low/close")
-    df = candles.copy().dropna(subset=list(required)).sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported backtest timeframe: {timeframe}")
+
+    df = candles.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    if df["time"].isna().any():
+        raise ValueError("Historical candles contain invalid timestamps")
+    if df["time"].duplicated().any():
+        raise ValueError("Historical candles contain duplicate timestamps")
+    df = df.sort_values("time").reset_index(drop=True)
     for column in ("open", "high", "low", "close"):
         df[column] = pd.to_numeric(df[column], errors="coerce")
     valid = ((df[["open", "high", "low", "close"]] > 0).all(axis=1)
@@ -27,14 +43,25 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
              & (df["low"] <= df[["open", "high", "close"]].min(axis=1)))
     if not bool(valid.all()):
         raise ValueError("Historical CSV contains invalid OHLC rows")
+
+    expected = TIMEFRAME_SECONDS[timeframe]
+    gaps = df["time"].diff().dt.total_seconds().dropna()
+    if bool((gaps > expected * 1.5).any()):
+        raise ValueError("Historical candles contain timeframe gaps; repair or explicitly exclude them before backtesting")
+    return df
+
+
+def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
+    timeframe = config.get("data", {}).get("timeframe", "1m")
+    df = prepare_historical_candles(candles, timeframe)
     if len(df) < int(config.get("indicators", {}).get("ema_slow_period", 15)) + 4:
         raise ValueError("Not enough historical candles for EMA warm-up and trades")
 
     ind = config.get("indicators", {})
     risk = config.get("risk", {})
+    general = config.get("general", {})
     exits = config.get("exit", {})
     execution = config.get("execution", {})
-    timeframe = config.get("data", {}).get("timeframe", "1m")
     previous_close = df["close"].shift(1)
     true_range = pd.concat([
         df["high"] - df["low"],
@@ -66,12 +93,13 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
     day_trades = 0
     day_pnl = 0.0
     consecutive_losses = 0
+    timezone_name = general.get("timezone", "Asia/Kolkata")
 
     def local_day(value):
         stamp = pd.Timestamp(value)
         if stamp.tzinfo is None:
             stamp = stamp.tz_localize("UTC")
-        return stamp.tz_convert(risk.get("timezone", "Asia/Kolkata")).date()
+        return stamp.tz_convert(timezone_name).date()
 
     def entry_block_reason(signal_time):
         if not exits.get("mandatory_stop_loss", True):
@@ -92,7 +120,7 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
             stamp = pd.Timestamp(signal_time)
             if stamp.tzinfo is None:
                 stamp = stamp.tz_localize("UTC")
-            local_time = stamp.tz_convert(risk.get("timezone", "Asia/Kolkata")).strftime("%H:%M")
+            local_time = stamp.tz_convert(timezone_name).strftime("%H:%M")
             start_time = risk.get("trading_start_time", "00:00")
             end_time = risk.get("trading_end_time", "23:59")
             within = start_time <= local_time <= end_time if start_time <= end_time else (local_time >= start_time or local_time <= end_time)
@@ -252,6 +280,17 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
             "trades": len(subset), "wins": sum(t["net_pnl"] > 0 for t in subset),
             "net_pnl": round(sum(t["net_pnl"] for t in subset), 4),
         }
+    expectancy = sum(t["net_pnl"] for t in trades) / len(trades) if trades else 0.0
+    # Daily realized-return Sharpe avoids annualising minute bars and avoids
+    # treating every intraday trade as an independent calendar-day return.
+    daily_returns = {}
+    for trade in trades:
+        day = pd.Timestamp(trade["exit_time"]).date().isoformat()
+        daily_returns[day] = daily_returns.get(day, 0.0) + trade["net_pnl"] / capital
+    returns = pd.Series(list(daily_returns.values()), dtype=float)
+    sharpe = None
+    if len(returns) >= 2 and float(returns.std(ddof=1)) > 0:
+        sharpe = round(float(returns.mean() / returns.std(ddof=1) * (365 ** 0.5)), 4)
     return {
         "total_trades": len(trades), "winning_trades": len(wins), "losing_trades": len(losses),
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2) if trades else 0.0,
@@ -259,6 +298,10 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
         "maximum_drawdown_pct": round(max_drawdown * 100, 2),
         "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss else (None if gross_profit else 0.0),
         "average_risk_reward": round(sum(t["realized_r"] for t in trades) / len(trades), 3) if trades else 0.0,
+        "expectancy_per_trade": round(expectancy, 4),
+        "sharpe_ratio_daily": sharpe,
+        "funding_costs": 0.0,
+        "funding_model": "not_modelled",
         "average_planned_risk_reward": (
             round(sum(t["planned_rr"] for t in trades if t["planned_rr"] is not None)
                   / sum(t["planned_rr"] is not None for t in trades), 3)
@@ -268,6 +311,25 @@ def run_ema_backtest(candles: pd.DataFrame, config: dict) -> dict:
         "rejected_signals": rejected_signals,
         "long_performance": direction_stats["LONG"], "short_performance": direction_stats["SHORT"],
         "trades": trades,
+    }
+
+
+def run_walk_forward_backtest(candles: pd.DataFrame, config: dict, in_sample_fraction: float = 0.70) -> dict:
+    """Report fixed chronological in-sample and untouched out-of-sample results."""
+    if not 0.5 <= in_sample_fraction < 1.0:
+        raise ValueError("in_sample_fraction must be at least 0.5 and below 1.0")
+    timeframe = config.get("data", {}).get("timeframe", "1m")
+    df = prepare_historical_candles(candles, timeframe)
+    split = int(len(df) * in_sample_fraction)
+    slow = int(config.get("indicators", {}).get("ema_slow_period", 15))
+    if split < slow + 4 or len(df) - split < slow + 4:
+        raise ValueError("Not enough data in both walk-forward segments")
+    return {
+        "split": {"in_sample_rows": split, "out_of_sample_rows": len(df) - split,
+                  "in_sample_end": df.iloc[split - 1]["time"].isoformat(),
+                  "out_of_sample_start": df.iloc[split]["time"].isoformat()},
+        "in_sample": run_ema_backtest(df.iloc[:split], config),
+        "out_of_sample": run_ema_backtest(df.iloc[split:], config),
     }
 
 
@@ -281,7 +343,7 @@ def main():
     candles = pd.read_csv(args.csv)
     with open(args.config, "r", encoding="utf-8") as f:
         settings = json.load(f)
-    result = run_ema_backtest(candles, settings)
+    result = run_walk_forward_backtest(candles, settings)
     print(json.dumps(result, indent=2, allow_nan=False))
 
 

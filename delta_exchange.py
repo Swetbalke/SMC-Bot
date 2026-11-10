@@ -126,7 +126,10 @@ class DeltaDemoClient:
 
     def _request(self, method, path, params=None, body=None, authenticated=True):
         method = method.upper()
-        query = urlencode(sorted((params or {}).items()))
+        # Sign the exact query-string ordering that requests will transmit.
+        # A different ordering makes an otherwise valid HMAC fail verification.
+        ordered_params = dict(sorted((params or {}).items()))
+        query = urlencode(ordered_params)
         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body is not None else ""
         headers = {"Accept": "application/json", "User-Agent": "tradingbot-demo/1.0"}
         if body is not None:
@@ -137,7 +140,7 @@ class DeltaDemoClient:
             signature = hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
             headers.update({"api-key": self.api_key, "timestamp": timestamp, "signature": signature})
         try:
-            response = requests.request(method, BASE_URL + path, params=params, data=payload or None,
+            response = requests.request(method, BASE_URL + path, params=ordered_params, data=payload or None,
                                         headers=headers, timeout=self.timeout)
         except requests.RequestException as exc:
             raise DeltaAPIError(f"Delta testnet request failed: {type(exc).__name__}") from exc
@@ -169,6 +172,10 @@ class DeltaDemoClient:
             raise DeltaAPIError("Only BTCUSD is enabled for the initial demo integration")
         return self._request_with_retry("GET", f"/v2/products/{symbol}", authenticated=False)
 
+    def get_server_time(self):
+        """Read Delta's server-time endpoint without sending credentials."""
+        return self._request_with_retry("GET", "/v2/time", authenticated=False)
+
     def get_position(self, product_id):
         return self._request_with_retry("GET", "/v2/positions", params={"product_id": int(product_id)})
 
@@ -196,6 +203,13 @@ class DeltaDemoClient:
             elif result:
                 active.append(result)
         return active
+
+    def get_order_by_client_order_id(self, client_order_id):
+        """Read an order after an ambiguous submission without creating another."""
+        if not client_order_id or len(str(client_order_id)) > 32:
+            raise DeltaAPIError("client_order_id must be 1-32 characters")
+        return self._request_with_retry(
+            "GET", f"/v2/orders/client_order_id/{client_order_id}")
 
     def place_market_order(self, product_id, symbol, direction, contracts, client_order_id):
         if direction not in {"LONG", "SHORT"} or int(contracts) != contracts or contracts <= 0:

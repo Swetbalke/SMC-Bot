@@ -8,12 +8,14 @@ import threading
 import json
 import math
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from zoneinfo import ZoneInfo
 
 DB_PATH = Path(__file__).parent / "data" / "paper_sim.db"
 DB_PATH.parent.mkdir(exist_ok=True)
+TRADING_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 _lock = threading.Lock()
 
@@ -92,6 +94,10 @@ def init_db():
                 trailing_status TEXT NOT NULL DEFAULT 'active',
                 trailing_last_candle_time TEXT,
                 entry_config_json TEXT NOT NULL DEFAULT '{}'
+                ,delta_status TEXT NOT NULL DEFAULT 'SKIPPED'
+                ,delta_reason TEXT
+                ,delta_order_id TEXT
+                ,delta_updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS closed_trades (
@@ -115,6 +121,13 @@ def init_db():
                 execution_venue TEXT NOT NULL DEFAULT 'PAPER_ONLY',
                 delta_order_id TEXT,
                 target_rrr REAL NOT NULL DEFAULT 0
+                ,delta_status TEXT NOT NULL DEFAULT 'SKIPPED'
+                ,delta_reason TEXT
+                ,delta_updated_at TEXT
+                ,delta_close_status TEXT
+                ,delta_close_reason TEXT
+                ,delta_close_order_id TEXT
+                ,delta_close_updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS strategy_signals (
@@ -192,7 +205,31 @@ def init_db():
             "trailing_status": "TEXT NOT NULL DEFAULT 'active'",
             "trailing_last_candle_time": "TEXT",
             "entry_config_json": "TEXT NOT NULL DEFAULT '{}'",
+            "delta_status": "TEXT NOT NULL DEFAULT 'SKIPPED'",
+            "delta_reason": "TEXT",
+            "delta_order_id": "TEXT",
+            "delta_updated_at": "TEXT",
         }
+        closed_columns = {row[1] for row in conn.execute("PRAGMA table_info(closed_trades)")}
+        closed_additions = {
+            "signal_id": "TEXT",
+            "execution_venue": "TEXT NOT NULL DEFAULT 'PAPER_ONLY'",
+            "delta_order_id": "TEXT",
+            "target_rrr": "REAL NOT NULL DEFAULT 0",
+            "delta_status": "TEXT NOT NULL DEFAULT 'SKIPPED'",
+            "delta_reason": "TEXT",
+            "delta_updated_at": "TEXT",
+            "delta_close_status": "TEXT",
+            "delta_close_reason": "TEXT",
+            "delta_close_order_id": "TEXT",
+            "delta_close_updated_at": "TEXT",
+        }
+        if any(name not in columns for name in additions) or any(name not in closed_columns for name in closed_additions):
+            backup_dir = DB_PATH.parent / "backups"
+            backup_dir.mkdir(exist_ok=True)
+            backup_path = backup_dir / f"paper_sim_pre_migration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            with sqlite3.connect(str(backup_path)) as backup:
+                conn.backup(backup)
         for name, declaration in additions.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE open_positions ADD COLUMN {name} {declaration}")
@@ -203,14 +240,7 @@ def init_db():
         conn.execute("UPDATE open_positions SET trailing_status='disabled' WHERE trailing_enabled=0 AND trailing_status='active'")
         # Legacy open positions used percentage trailing; keep that behavior.
         conn.execute("UPDATE open_positions SET trailing_method='percentage' WHERE trailing_enabled=1 AND entry_config_json='{}' AND trailing_method='rr'")
-        closed_columns = {row[1] for row in conn.execute("PRAGMA table_info(closed_trades)")}
-        if "signal_id" not in closed_columns:
-            conn.execute("ALTER TABLE closed_trades ADD COLUMN signal_id TEXT")
-        for name, declaration in {
-            "execution_venue": "TEXT NOT NULL DEFAULT 'PAPER_ONLY'",
-            "delta_order_id": "TEXT",
-            "target_rrr": "REAL NOT NULL DEFAULT 0",
-        }.items():
+        for name, declaration in closed_additions.items():
             if name not in closed_columns:
                 conn.execute(f"ALTER TABLE closed_trades ADD COLUMN {name} {declaration}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_open_signal_id ON open_positions(signal_id) WHERE signal_id IS NOT NULL")
@@ -273,14 +303,16 @@ def get_strategy_runtime() -> Dict[str, Any]:
 
 def reset_daily():
     """Daily reset at midnight."""
-    today = date.today().isoformat()
+    # Risk limits and the engine session use IST.  Do not depend on the host
+    # timezone, which is commonly UTC on an Ubuntu server.
+    today = datetime.now(TRADING_TIMEZONE).date().isoformat()
     update_state(daily_pnl=0.0, daily_trades=0, last_reset_date=today)
 
 
 def check_and_reset_daily():
     """Auto-reset if date changed since last reset."""
     state = get_state()
-    today = date.today().isoformat()
+    today = datetime.now(TRADING_TIMEZONE).date().isoformat()
     if state.get("last_reset_date", "") != today:
         reset_daily()
         log_event("INFO", "database", f"Daily reset performed for {today}")
@@ -297,7 +329,9 @@ def save_position(symbol: str, direction: str, entry_price: float,
                   signal_id: str = None, trailing_enabled: bool = False,
                   trailing_stop_pct: float = 0.3, initial_sl_price: float = None,
                   initial_risk_points: float = None, trailing_settings: Dict = None,
-                  entry_config: Dict = None, rr_milestones_enabled: bool = True) -> int:
+                  entry_config: Dict = None, rr_milestones_enabled: bool = True,
+                  delta_status: str = "SKIPPED", delta_reason: str = None,
+                  delta_order_id: str = None, delta_updated_at: str = None) -> int:
     trailing_settings = trailing_settings or {}
     initial_sl_price = float(sl_price if initial_sl_price is None else initial_sl_price)
     initial_risk_points = float(abs(entry_price - initial_sl_price) if initial_risk_points is None else initial_risk_points)
@@ -309,8 +343,9 @@ def save_position(symbol: str, direction: str, entry_price: float,
              initial_sl_price, initial_risk_points, rr_milestones_enabled, trailing_method, trailing_update_frequency,
              breakeven_trigger_rr, profit_lock_trigger_rr, profit_lock_level_rr,
              trailing_stop_points, atr_period, atr_multiplier, fee_adjust_breakeven,
-             best_favorable_price, trailing_status, entry_config_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             best_favorable_price, trailing_status, entry_config_json,
+             delta_status, delta_reason, delta_order_id, delta_updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (symbol, direction, entry_price, quantity, sl_price, tp_price, entry_time, signal_reason,
               int(sl_enabled), int(tp_enabled), signal_id, int(trailing_enabled), trailing_stop_pct,
               initial_sl_price, initial_risk_points, int(rr_milestones_enabled),
@@ -323,8 +358,36 @@ def save_position(symbol: str, direction: str, entry_price: float,
               trailing_settings.get("atr_period", 14), trailing_settings.get("atr_multiplier", 2.0),
               int(trailing_settings.get("fee_adjust_breakeven", False)),
               float(entry_price), "active" if trailing_enabled else "disabled",
-              json.dumps(entry_config or {}, sort_keys=True)))
+              json.dumps(entry_config or {}, sort_keys=True), delta_status, delta_reason,
+              delta_order_id, delta_updated_at))
         return cur.lastrowid
+
+
+def update_open_delta_mirror(pos_id: int, status: str, reason: str = None,
+                             order_id: str = None, updated_at: str = None) -> bool:
+    """Persist non-sensitive Delta mirror state without affecting paper trade state."""
+    with _lock, _get_conn() as conn:
+        cur = conn.execute("""UPDATE open_positions
+            SET delta_status=?, delta_reason=?, delta_order_id=COALESCE(?, delta_order_id),
+                delta_updated_at=? WHERE id=?""",
+            (str(status), reason, order_id, updated_at, pos_id))
+        return cur.rowcount == 1
+
+
+def update_closed_delta_mirror(trade_id: int, status: str = None, reason: str = None,
+                               order_id: str = None, updated_at: str = None,
+                               close_status: str = None, close_reason: str = None,
+                               close_order_id: str = None, close_updated_at: str = None) -> bool:
+    with _lock, _get_conn() as conn:
+        cur = conn.execute("""UPDATE closed_trades SET
+            delta_status=COALESCE(?, delta_status), delta_reason=COALESCE(?, delta_reason),
+            delta_order_id=COALESCE(?, delta_order_id), delta_updated_at=COALESCE(?, delta_updated_at),
+            delta_close_status=COALESCE(?, delta_close_status), delta_close_reason=COALESCE(?, delta_close_reason),
+            delta_close_order_id=COALESCE(?, delta_close_order_id),
+            delta_close_updated_at=COALESCE(?, delta_close_updated_at) WHERE id=?""",
+            (status, reason, order_id, updated_at, close_status, close_reason,
+             close_order_id, close_updated_at, trade_id))
+        return cur.rowcount == 1
 
 
 def has_signal_been_traded(signal_id: str) -> bool:
@@ -407,19 +470,20 @@ def record_trade(symbol: str, direction: str,
                  entry_time: str, exit_time: str, duration_min: int,
                  exit_reason: str, signal_reason: str = "", signal_id: str = None,
                  execution_venue: str = "PAPER_ONLY", delta_order_id: str = None,
-                 target_rrr: float = 0.0):
+                 target_rrr: float = 0.0, delta_status: str = "SKIPPED",
+                 delta_reason: str = None, delta_updated_at: str = None):
     with _lock, _get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO closed_trades
             (symbol, direction, entry_price, exit_price, quantity,
              sl_price, tp_price, gross_pnl, fee, net_pnl,
              entry_time, exit_time, duration_min, exit_reason, signal_reason, signal_id,
-             execution_venue, delta_order_id, target_rrr)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             execution_venue, delta_order_id, target_rrr, delta_status, delta_reason, delta_updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (symbol, direction, entry_price, exit_price, quantity,
               sl_price, tp_price, gross_pnl, fee, net_pnl,
               entry_time, exit_time, duration_min, exit_reason, signal_reason, signal_id,
-              execution_venue, delta_order_id, target_rrr))
+              execution_venue, delta_order_id, target_rrr, delta_status, delta_reason, delta_updated_at))
         trade_id = cur.lastrowid
         state = conn.execute("SELECT daily_pnl, daily_trades, balance FROM sim_state WHERE id=1").fetchone()
         if state:

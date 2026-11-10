@@ -19,6 +19,9 @@ PASS = "✅ PASS"
 FAIL = "❌ FAIL"
 SKIP = "⬜ SKIP"
 results = []
+# This file is a standalone script-style smoke suite. Its helper is not a
+# pytest fixture/test; prevent pytest from collecting it as one test function.
+__test__ = False
 
 
 def test(name: str, condition: bool, detail: str = ""):

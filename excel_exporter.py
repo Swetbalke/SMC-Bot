@@ -28,7 +28,8 @@ class ExcelExporter:
 
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path else EXCEL_PATH
-        self._queue: queue.Queue = queue.Queue()
+        # Reporting must never consume unbounded memory or block risk handling.
+        self._queue: queue.Queue = queue.Queue(maxsize=100)
         self._thread = threading.Thread(target=self._worker, daemon=True, name="excel-exporter")
         self._thread.start()
 
@@ -36,7 +37,11 @@ class ExcelExporter:
         if openpyxl is None:
             logger.warning("Excel export skipped: install openpyxl to enable workbook output")
             return
-        self._queue.put(dict(trade_data))
+        try:
+            self._queue.put_nowait(dict(trade_data))
+        except queue.Full:
+            logger.error("Excel export queue is full; trade %s remains in SQLite and was not exported",
+                         trade_data.get("trade_id"))
 
     def close(self, timeout: float = 5.0) -> None:
         if self._thread.is_alive():

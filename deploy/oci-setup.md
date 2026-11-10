@@ -1,6 +1,6 @@
 # Oracle Cloud deployment (Ubuntu, Delta Demo/Testnet)
 
-These files assume the repository is cloned to `/home/ubuntu/SMC-Bot` and that
+These files assume the repository is cloned to `/home/ubuntu/tradingbot` and that
 the Ubuntu account is named `ubuntu`. The engine uses the existing
 `config/bot_settings.json`; inspect its execution mode and demo-order setting
 before enabling the service.
@@ -26,8 +26,8 @@ On the VM:
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv git
-git clone https://github.com/Swetbalke/SMC-Bot.git /home/ubuntu/SMC-Bot
-cd /home/ubuntu/SMC-Bot
+git clone https://github.com/Swetbalke/SMC-Bot.git /home/ubuntu/tradingbot
+cd /home/ubuntu/tradingbot
 python3 -m venv venv
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
@@ -65,6 +65,14 @@ shell command. Confirm that `config/bot_settings.json` says `delta_demo` only
 when you intend the engine to submit Demo/Testnet orders, and review symbol,
 position size, loss limit, and open positions first.
 
+Before starting either service, run the read-only connection check. It verifies
+the Demo credentials, Delta server time, the BTCUSD product, settlement wallet,
+and current position; it never places an order:
+
+```bash
+sudo sh -c 'set -a; . /etc/smc-trading-bot.env; set +a; exec /home/ubuntu/tradingbot/venv/bin/python /home/ubuntu/tradingbot/test_connection.py'
+```
+
 ## 4. Install the background services
 
 From the project directory on the VM:
@@ -91,6 +99,10 @@ sudo journalctl -u smc-dashboard -f
 sudo systemctl restart smc-engine
 sudo systemctl stop smc-engine
 ```
+
+Service stdout/stderr go to the system journal, so `journalctl` is the source
+for service diagnostics. Application files under `logs/` are separately size-
+rotated by the Python logger.
 
 The SQLite database stays under `data/` on the VM boot volume. Arrange a
 separate backup before relying on it as long-term storage.

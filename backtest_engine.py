@@ -88,6 +88,10 @@ class BacktestEngine:
             return None
 
         df = candles.copy()
+        if getattr(self._data_client, "last_candle_forming", False):
+            # Historical evaluation must not treat a still-forming market bar as
+            # a completed bar.  The live engine follows the same rule.
+            df = df.iloc[:-1].copy()
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
         df = df[df["time"] >= cutoff].dropna(subset=["time"]).reset_index(drop=True)
@@ -107,6 +111,7 @@ class BacktestEngine:
             "window_hours": 24,
             "computed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "config_hash": cfg_hash,
+            "funding_model": result.get("funding_model", "not_modelled"),
         }
         run_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         record_backtest_result(run_at, cfg_hash, metrics)

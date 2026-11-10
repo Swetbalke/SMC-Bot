@@ -162,11 +162,8 @@ def color_pnl(val: float) -> str:
 
 
 def get_execution_positions(symbol=None) -> list:
-    """Return local position records that belong to the active execution mode."""
+    """Return local paper positions; Delta mirroring never owns trade state."""
     positions = get_open_positions()
-    if config.get("execution.mode", "paper") == "delta_demo":
-        positions = [p for p in positions
-                     if p.get("entry_config", {}).get("delta_entry_order_id")]
     if symbol:
         positions = [p for p in positions if p.get("symbol") == symbol]
     return positions
@@ -479,26 +476,6 @@ if "Terminal" in page:
 
         @st.fragment(run_every=15)
         def open_positions_panel():
-            if config.get("execution.mode", "paper") == "delta_demo":
-                exchange = get_exchange_status()
-                position = exchange.get("position") or {}
-                size = int(position.get("size") or 0)
-                if not exchange.get("connected"):
-                    st.error(exchange.get("message", "Demo exchange is disconnected"))
-                elif size == 0:
-                    st.info("No open BTCUSD Demo position")
-                else:
-                    direction = "LONG" if size > 0 else "SHORT"
-                    entry = float(position.get("entry_price") or 0)
-                    unreal = position.get("unrealized_pnl")
-                    st.markdown(f"**{'🟢' if size > 0 else '🔴'} {direction} · BTCUSD · {abs(size)} contracts**")
-                    st.write(f"Exchange entry: ${entry:,.2f} · Exchange SL: ${float(exchange.get('protective_sl') or 0):,.1f}")
-                    if exchange.get("protective_tp"):
-                        st.write(f"Exchange TP: ${float(exchange['protective_tp']):,.1f}")
-                    if unreal is not None:
-                        st.metric("Exchange unrealized P&L", f"${float(unreal):+.4f}")
-                    st.caption("Position and bracket status synchronized from Delta Demo/Testnet.")
-                return
             open_pos = get_open_positions()
 
             if not open_pos:
@@ -522,6 +499,8 @@ if "Terminal" in page:
                     color = "#4caf50" if direction == "LONG" else "#ef5350"
                     emoji = "🟢" if direction == "LONG" else "🔴"
                     safe_reason = html.escape(str(pos.get("signal_reason", "")))
+                    mirror_status = html.escape(str(pos.get("delta_status", "SKIPPED")))
+                    mirror_reason = html.escape(str(pos.get("delta_reason") or ""))
 
                     unreal = 0.0
                     estimated_fees = 0.0
@@ -547,6 +526,7 @@ if "Terminal" in page:
                         <div style="color:#94a3b8;font-size:12px">Initial Risk: <span style="color:#e2e8f0;font-family:monospace">{initial_risk:,.2f} points</span> · Current R: <span style="color:#e2e8f0;font-family:monospace">{current_rr:+.2f}R</span></div>
                         <div style="color:#94a3b8;font-size:12px">Trailing: <span style="color:#e2e8f0">{trail_status}</span> · Breakeven: <span style="color:#e2e8f0">{'Yes' if at_breakeven else 'No'}</span> · Locked Profit: <span style="color:#4caf50;font-family:monospace">{locked_profit:,.2f} points</span></div>
                         <div style="color:#94a3b8;font-size:12px">TP: <span style="color:#4caf50;font-family:monospace">{'$%0.2f' % tp if pos.get('tp_enabled', 1) else 'Disabled'}</span></div>
+                        <div style="color:#94a3b8;font-size:12px">Delta mirror: <span title="{mirror_reason}">{mirror_status}</span></div>
                         <div style="color:#94a3b8;font-size:12px;margin-top:6px">Unrealized (estimated fees included): <span style="color:{unreal_color};font-weight:600;font-family:monospace">${net_unreal:+.4f}</span></div>
                         <div style="color:#64748b;font-size:11px;margin-top:4px">{safe_reason}</div>
                     </div>
@@ -570,10 +550,10 @@ if "Terminal" in page:
                 return
 
             df = pd.DataFrame(trades)
-            display_cols = ["id", "exit_time", "symbol", "execution_venue", "direction", "entry_price",
+            display_cols = ["id", "exit_time", "symbol", "delta_status", "delta_reason", "direction", "entry_price",
                             "exit_price", "quantity", "net_pnl", "exit_reason"]
             df_display = df[display_cols].copy()
-            df_display.columns = ["Trade ID", "Exit Time", "Symbol", "Venue", "Dir", "Entry $",
+            df_display.columns = ["Trade ID", "Exit Time", "Symbol", "Delta", "Delta Detail", "Dir", "Entry $",
                                    "Exit $", "Qty", "Net P&L", "Reason"]
             df_display["Dir"] = df_display["Dir"].map({"LONG": "BUY", "SHORT": "SELL"}).fillna(df_display["Dir"])
             df_display["Net P&L"] = df_display["Net P&L"].apply(lambda x: f"${x:+.4f}")
@@ -746,10 +726,9 @@ elif "Settings" in page:
         if ema_trail_preset:
             st.info("Closed-candle EMA crossover entries in both directions · initial SL 100 points · no fixed TP · trailing SL follows each favorable price move by 1 point with a 100-point gap. Updates run on the configured fresh-price polling interval.")
         demo_trading_enabled = bool(cfg.get("execution", {}).get("demo_trading_enabled", False))
-        if config.get("execution.mode", "paper") == "delta_demo":
-            demo_trading_enabled = st.checkbox("Enable automatic Delta Demo orders",
-                value=demo_trading_enabled,
-                help="Signals may open BTCUSD positions on the Delta Demo account. Requires a rotated Demo API key/secret in local Windows environment variables.")
+        delta_mirror_enabled = st.checkbox("Enable optional Delta Demo mirror",
+            value=bool(cfg.get("execution", {}).get("delta_mirror_enabled", False)),
+            help="Paper trading always remains independent. Delta failures are shown only as a mirror status.")
 
         # ---- Risk Management ----
         st.markdown('<div class="section-header">💰 Risk Management</div>', unsafe_allow_html=True)
@@ -1084,7 +1063,8 @@ elif "Settings" in page:
             updated["entry"]["max_daily_trades"] = max_daily_trades
             updated["processing"].update(analysis_interval_sec=analysis_interval, position_check_interval_sec=pos_check)
             updated.setdefault("execution", {}).update(fee_rate_per_side=fee_rate,
-                slippage_bps=slippage_bps, demo_trading_enabled=demo_trading_enabled)
+                slippage_bps=slippage_bps, demo_trading_enabled=demo_trading_enabled,
+                delta_mirror_enabled=delta_mirror_enabled, mode="paper")
             try:
                 if not config.update_all(updated):
                     st.error("Settings file save nahi hui. Purani configuration hi active hai.")

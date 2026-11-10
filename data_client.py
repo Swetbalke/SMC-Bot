@@ -32,7 +32,6 @@ from logger_setup import get_logger
 logger = get_logger("data_client")
 
 ENVS = {
-    "production": "https://api.india.delta.exchange",   # asli market price
     "testnet": "https://cdn-ind.testnet.deltaex.org",    # Delta India demo
 }
 # Delta India ka symbol BTCUSD hai. Purane naam apne aap badal jate hain.
@@ -50,8 +49,10 @@ class DeltaPublicClient:
     def __init__(self, fallback_csv: Optional[str] = None, env: Optional[str] = None,
                  max_stale_sec: int = 120):
         # fallback_csv sirf purane code ke saath compatible rehne ke liye hai. Ab use NAHI hota.
-        env = (env or os.environ.get("DELTA_ENV", "production")).strip().lower()
-        self.env = env if env in ENVS else "production"
+        # This project is Demo/Testnet-only.  A missing, malformed, or
+        # production setting must not select a production endpoint.
+        env = (env or os.environ.get("DELTA_ENV", "testnet")).strip().lower()
+        self.env = "testnet"
         self.base_url = ENVS[self.env]
         self.max_stale_sec = max_stale_sec
         self.candle_ttl = 8.0
@@ -59,7 +60,7 @@ class DeltaPublicClient:
         self._lock = threading.RLock()
         self._cache = None            # {"sym", "df" (1m), "ts", "n"}
         self._price_cache = {}        # sym -> (price, ts)
-        self._last_error = ""
+        self._last_error = "" if env == "testnet" else "Non-testnet DELTA_ENV ignored; using testnet"
         self.last_candle_forming = False   # kya df ki aakhri row abhi chal rahi candle hai?
         self.data_age_sec: Optional[float] = None
         self.last_symbol = ""

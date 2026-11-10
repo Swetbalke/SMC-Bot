@@ -25,7 +25,7 @@ from database import (
     record_trade, log_signal, log_event, get_performance_summary, get_all_trades,
     update_strategy_runtime, has_signal_been_traded,
     update_position_stop, update_trailing_candle_time, update_exchange_status,
-    get_exchange_status
+    get_exchange_status, update_open_delta_mirror, update_closed_delta_mirror
 )
 from data_client import DeltaPublicClient, generate_sample_csv
 from strategy import detect_signals, calc_sl_tp, calc_quantity
@@ -140,6 +140,9 @@ class PaperEngine:
         self._delta_settlement_asset = None
         self._delta_settlement_asset_id = None
         self._delta_risk_error = None
+        self._delta_failures = 0
+        self._delta_paused_until = 0.0
+        self._delta_circuit_seconds = 300
 
     # ------------------------------------------------------------------ #
     # Startup
@@ -167,7 +170,7 @@ class PaperEngine:
 
         # 3. Initialize data client
         fallback_csv = config.get("data.fallback_csv", "data/btc_1m_sample.csv")
-        delta_demo_mode = config.get("execution.mode", "paper") == "delta_demo"
+        delta_demo_mode = bool(config.get("execution.delta_mirror_enabled", False))
         self._data_client = DeltaPublicClient(
             fallback_csv=fallback_csv, env="testnet" if delta_demo_mode else None)
         if delta_demo_mode:
@@ -185,17 +188,10 @@ class PaperEngine:
         # 6. Mark as running
         self.running = True
         update_state(engine_status="running", engine_heartbeat=now_ist_str())
-        mode_label = "Delta Demo execution" if config.get("execution.mode", "paper") == "delta_demo" else "paper simulator active"
+        mode_label = "paper simulator active (Delta mirror optional)"
         log_event("INFO", "engine", f"Engine running — {mode_label}")
 
-        try:
-            from backtest_engine import BacktestEngine
-            self._backtest_engine = BacktestEngine(self._data_client)
-            self._backtest_engine.start()
-        except Exception as exc:
-            self._backtest_engine = None
-            logger.exception("24-hour backtest service could not start: %s", exc)
-            log_event("WARNING", "backtest", f"24-hour backtest service could not start: {exc}")
+        self._backtest_engine = None
 
         # 7. Main loop
         self._main_loop()
@@ -220,7 +216,7 @@ class PaperEngine:
         try:
             if config.get("general.symbol", "BTCUSD") != "BTCUSD":
                 raise DeltaAPIError("Delta Demo execution is restricted to BTCUSD")
-            self._delta_client = DeltaDemoClient()
+            self._delta_client = DeltaDemoClient(timeout=3)
             self._delta_product = self._delta_client.get_product("BTCUSD")
             if self._delta_product.get("trading_status") != "operational":
                 raise DeltaAPIError("BTCUSD demo contract is not operational")
@@ -248,7 +244,7 @@ class PaperEngine:
                         else current_balance)
             self._delta_account_clear = True
             self._delta_risk_error = None
-            self._delta_ready = bool(config.get("execution.demo_trading_enabled", False))
+            self._delta_ready = bool(config.get("execution.delta_mirror_enabled", False))
             update_exchange_status({"environment": "Delta India Demo/Testnet", "connected": True,
                                     "ready": self._delta_ready, "symbol": "BTCUSD", "position": position,
                                     "read_check_ok": True, "checked_at": now_ist_str(),
@@ -256,9 +252,9 @@ class PaperEngine:
                                     "daily_baseline": baseline, "daily_baseline_date": day_key,
                                     "account_balance": current_balance,
                                     "open_orders": orders,
-                                    "message": ("Ready; account exposure is clear" if self._delta_ready
-                                                else "Connected read-only; automatic Demo orders remain disabled in Settings")})
-            log_event("INFO", "delta_demo", "Demo API connected; order permission setting is " +
+                                    "message": ("Ready for optional paper-trade mirroring" if self._delta_ready
+                                                else "Connected read-only; Delta mirroring is disabled")})
+            log_event("INFO", "delta_demo", "Demo API connected; paper-trade mirroring is " +
                       ("enabled" if self._delta_ready else "disabled"))
         except Exception as exc:
             self._delta_ready = False
@@ -353,9 +349,9 @@ class PaperEngine:
                 # Poll config independently from analysis cadence; apply without restart.
                 config.reload()
                 self._ack_config()
-                if (config.get("execution.mode", "paper") == "delta_demo" and
+                if (config.get("execution.delta_mirror_enabled", False) and
                         self._delta_account_clear and self._delta_client is not None):
-                    requested_enabled = bool(config.get("execution.demo_trading_enabled", False))
+                    requested_enabled = True
                     if requested_enabled != self._delta_ready:
                         self._delta_ready = requested_enabled
                         exchange_status = get_exchange_status()
@@ -491,28 +487,9 @@ class PaperEngine:
         # Check if we can open new positions
         state = get_state()
         open_pos = get_open_positions()
-        if config.get("execution.mode", "paper") == "delta_demo":
-            open_pos = [p for p in open_pos if p.get("entry_config", {}).get("delta_entry_order_id")]
         daily_trades = state.get("daily_trades", 0)
         daily_pnl = state.get("daily_pnl", 0.0)
         balance = state.get("balance", 1000.0)
-        delta_risk_capital = None
-        if signal and config.get("execution.mode", "paper") == "delta_demo":
-            try:
-                daily_pnl, delta_risk_capital = self._get_delta_daily_pnl()
-            except Exception as exc:
-                message = f"Exchange daily risk balance unavailable: {str(exc)[:180]}"
-                # Block this entry but retain a verified client so exchange
-                # position and protective-order monitoring can continue.
-                self._delta_risk_error = message
-                status = get_exchange_status()
-                status.update(environment="Delta India Demo/Testnet",
-                              connected=bool(self._delta_client and self._delta_product),
-                              ready=False, symbol="BTCUSD", message=message)
-                update_exchange_status(status)
-                log_event("ERROR", "delta_demo", message)
-                self._reject_signal(symbol, signal, price, "Exchange daily risk check unavailable")
-                return
 
         max_daily_trades = config.get("entry.max_daily_trades", 5)
         max_daily_loss_pct = config.get("risk.max_daily_loss_pct", 5.0)
@@ -520,13 +497,12 @@ class PaperEngine:
 
         # Daily loss limit check
         capital = config.get("risk.capital", 1000.0)
-        risk_basis = delta_risk_capital if delta_risk_capital is not None else capital
+        risk_basis = capital
         daily_loss_limit = (config.get("risk.max_daily_loss_amount", 0) or
                             risk_basis * (max_daily_loss_pct / 100.0))
 
         if daily_pnl <= -daily_loss_limit:
-            unit = self._delta_settlement_asset or "$" if delta_risk_capital is not None else "$"
-            self._reject_signal(symbol, signal, price, f"Daily loss limit reached ({daily_pnl:.2f} {unit})")
+            self._reject_signal(symbol, signal, price, f"Daily loss limit reached ({daily_pnl:.2f} $)")
             return
 
         if daily_trades >= max_daily_trades:
@@ -538,9 +514,6 @@ class PaperEngine:
             self._reject_signal(symbol, signal, price, "Daily profit target reached")
             return
         loss_limit = int(config.get("risk.max_consecutive_losses", 0))
-        if loss_limit > 0 and config.get("execution.mode", "paper") == "delta_demo":
-            self._reject_signal(symbol, signal, price, "Consecutive-loss rule needs exchange fill-history sync; demo entry blocked")
-            return
         if loss_limit > 0:
             streak = 0
             for trade in get_all_trades(limit=loss_limit):
@@ -593,12 +566,6 @@ class PaperEngine:
         cfg_risk = config.get_section("risk")
         symbol = config.get("general.symbol", "BTCUSDT")
         execution_cfg = config.get_section("execution")
-        if config.get("execution.mode", "paper") == "delta_demo":
-            exchange_balance = get_exchange_status().get("account_balance")
-            if exchange_balance is None:
-                self._reject_signal(symbol, signal, price, "Demo wallet balance is unavailable for position sizing")
-                return
-            balance = float(exchange_balance)
         if not cfg_exit.get("mandatory_stop_loss", True):
             self._reject_signal(symbol, signal, price,
                                 "Mandatory Stop Loss is disabled; new entries are locked for safety")
@@ -662,26 +629,6 @@ class PaperEngine:
                 self._reject_signal(symbol, signal, price, "Minimum lot would exceed configured risk budget")
                 return
 
-        if config.get("execution.mode", "paper") == "delta_demo":
-            if not self._delta_ready or self._delta_client is None:
-                self._reject_signal(symbol, signal, price, "Delta Demo is not ready; check Monitor for connection or account-state details")
-                return
-            try:
-                fill_price, quantity, sl_price, tp_price, delta_entry_order_id = self._execute_delta_demo(
-                    signal, signal_id, quantity, fill_price, sl_price, tp_price if use_tp else None,
-                    risk_distance, cfg_exit.get("use_trailing_stop", True))
-                risk_distance = abs(fill_price - sl_price)
-            except Exception as exc:
-                self._delta_ready = False
-                self._delta_account_clear = False
-                message = str(exc)[:240]
-                update_exchange_status({"environment": "Delta India Demo/Testnet", "connected": True,
-                                        "ready": False, "symbol": symbol,
-                                        "message": f"Trade blocked; verify exchange state manually: {message}"})
-                log_event("ERROR", "delta_demo", f"Order flow halted: {message}")
-                self._reject_signal(symbol, signal, price, f"Delta Demo order/protection not confirmed: {message}")
-                return
-
         trailing_settings = {key: cfg_exit.get(key) for key in (
             "trailing_method", "trailing_update_frequency", "breakeven_trigger_rr",
             "profit_lock_trigger_rr", "profit_lock_level_rr", "trailing_stop_points",
@@ -692,10 +639,11 @@ class PaperEngine:
             "slippage_bps": float(execution_cfg.get("slippage_bps", 2.0)),
             "timeframe": config.get("data.timeframe", "1m"),
             "use_take_profit": use_tp,
-            "execution_venue": "DELTA_TESTNET" if config.get("execution.mode", "paper") == "delta_demo" else "PAPER_ONLY",
+            "execution_venue": "PAPER_ONLY",
         }
-        if config.get("execution.mode", "paper") == "delta_demo":
-            entry_config["delta_entry_order_id"] = delta_entry_order_id
+        mirror_enabled = bool(config.get("execution.delta_mirror_enabled", False))
+        mirror_status = "PENDING" if mirror_enabled else "SKIPPED"
+        mirror_reason = None if mirror_enabled else "Delta mirror is disabled"
         try:
             pos_id = save_position(
                 symbol=symbol, direction=signal, entry_price=fill_price, quantity=quantity,
@@ -705,11 +653,10 @@ class PaperEngine:
                 trailing_stop_pct=cfg_exit.get("trailing_stop_pct", 0.3),
                 initial_sl_price=sl_price, initial_risk_points=risk_distance,
                 trailing_settings=trailing_settings, entry_config=entry_config,
-                rr_milestones_enabled=(cfg_exit.get("trailing_method") != "fixed_points"))
+                rr_milestones_enabled=(cfg_exit.get("trailing_method") != "fixed_points"),
+                delta_status=mirror_status, delta_reason=mirror_reason,
+                delta_updated_at=entry_time)
         except Exception as exc:
-            if config.get("execution.mode", "paper") == "delta_demo":
-                self._delta_ready = False
-                self._delta_account_clear = False
             self._reject_signal(symbol, signal, price, f"Could not persist protective stop: {exc}")
             return
 
@@ -730,21 +677,19 @@ class PaperEngine:
             f"  Signal:   {reason}\n"
             f"{'='*65}"
         )
-        protection_source = "exchange" if config.get("execution.mode", "paper") == "delta_demo" else "simulated"
         log_event("INFO", "engine",
-                  f"{signal} opened @ ${fill_price:,.2f} | qty={quantity} BTC | {protection_source} protective SL confirmed=${sl_price:.2f} | TP={'$%.2f' % tp_price if use_tp else 'disabled'} | fee={execution_cfg.get('fee_rate_per_side', FEE_RATE):.4%}/side | slippage={execution_cfg.get('slippage_bps', 2.0)}bps | {reason}")
+                  f"{signal} opened @ ${fill_price:,.2f} | qty={quantity} BTC | simulated protective SL=${sl_price:.2f} | TP={'$%.2f' % tp_price if use_tp else 'disabled'} | fee={execution_cfg.get('fee_rate_per_side', FEE_RATE):.4%}/side | slippage={execution_cfg.get('slippage_bps', 2.0)}bps | {reason}")
         log_signal(symbol, signal, fill_price, reason, acted_upon=True)
-        if config.get("execution.mode", "paper") == "delta_demo":
-            latest_state = get_state()
-            update_state(daily_trades=int(latest_state.get("daily_trades", 0)) + 1)
+        if mirror_enabled:
+            self._mirror_delta_entry(pos_id, signal, quantity, symbol)
 
     def _execute_delta_demo(self, direction, signal_id, quantity_btc, indicative_fill,
                             sl_price, tp_price, risk_distance, trailing_enabled):
         """Submit one testnet market entry and require exchange-side protection."""
         product = self._delta_product
         contract_value = float(product.get("contract_value") or 0)
-        if contract_value != 0.001:
-            raise DeltaAPIError("BTCUSD contract value changed; refusing stale BTC-to-contract conversion")
+        if not math.isfinite(contract_value) or contract_value <= 0:
+            raise DeltaAPIError("BTCUSD product has an invalid contract value")
         contracts = int(round(float(quantity_btc) / contract_value))
         if contracts <= 0 or abs(contracts * contract_value - float(quantity_btc)) > 1e-8:
             raise DeltaAPIError("Configured BTC quantity cannot be represented as whole BTCUSD contracts")
@@ -753,7 +698,28 @@ class PaperEngine:
         # ambiguous order submission automatically.
         import uuid
         client_id = uuid.uuid5(uuid.NAMESPACE_URL, f"tradingbot:{signal_id or time.time_ns()}").hex
-        order_result = self._delta_client.place_market_order(product["id"], "BTCUSD", direction, contracts, client_id)
+        try:
+            order_result = self._delta_client.place_market_order(
+                product["id"], "BTCUSD", direction, contracts, client_id)
+        except DeltaAPIError as submit_error:
+            # A network timeout can happen after Delta accepted the order.  Never
+            # resend it: look up the deterministic client id instead.  If it is
+            # still absent, stop the bot and require manual account review.
+            order_result = None
+            for _ in range(6):
+                try:
+                    order_result = self._delta_client.get_order_by_client_order_id(client_id)
+                except DeltaAPIError:
+                    order_result = None
+                if order_result:
+                    log_event("WARNING", "delta_demo",
+                              "Recovered an ambiguous Demo order by client_order_id; no order was retried")
+                    break
+                time.sleep(0.5)
+            if not order_result:
+                raise DeltaAPIError(
+                    "Market-order result is ambiguous and no matching client_order_id was found; "
+                    "no retry was sent. Check the Demo account manually.") from submit_error
         order_id = (order_result or {}).get("id")
 
         position = None
@@ -809,13 +775,76 @@ class PaperEngine:
                                 "message": "Demo position open; exchange bracket confirmed"})
         return entry, actual_contracts * contract_value, actual_sl, actual_tp if actual_tp else 0.0, order_id
 
+    @staticmethod
+    def _safe_delta_reason(exc) -> str:
+        """Keep exchange diagnostics useful without leaking request/auth details."""
+        message = str(exc).replace("\n", " ").replace("\r", " ")
+        for marker in ("api-key", "signature", "DELTA_API_KEY", "DELTA_API_SECRET"):
+            message = message.replace(marker, "[redacted]")
+        return message[:180] or type(exc).__name__
+
+    def _record_delta_failure(self, pos_id: int, reason: str) -> None:
+        self._delta_failures += 1
+        rejected_terms = ("reject", "insufficient", "min size", "invalid", "whitelist", "http 4")
+        status = "REJECTED" if any(term in reason.lower() for term in rejected_terms) else "FAILED"
+        if self._delta_failures >= 5:
+            self._delta_paused_until = time.monotonic() + self._delta_circuit_seconds
+            log_event("WARNING", "delta_mirror",
+                      f"Mirror paused for {self._delta_circuit_seconds}s after {self._delta_failures} consecutive failures")
+        update_open_delta_mirror(pos_id, status, reason, updated_at=now_ist_str())
+        log_event("WARNING", "delta_mirror", f"Paper trade #{pos_id} mirror failed: {reason}")
+
+    def _mirror_delta_entry(self, pos_id: int, direction: str, quantity_btc: float, symbol: str) -> None:
+        """Best-effort testnet mirror. It can never reject or change a paper trade."""
+        if time.monotonic() < self._delta_paused_until:
+            remaining = int(self._delta_paused_until - time.monotonic())
+            update_open_delta_mirror(pos_id, "SKIPPED", f"Circuit breaker active ({remaining}s remaining)",
+                                     updated_at=now_ist_str())
+            return
+        client_id = f"pt{pos_id}"
+        try:
+            if self._delta_client is None or self._delta_product is None:
+                self._connect_delta_demo()
+            if self._delta_client is None or self._delta_product is None:
+                raise DeltaAPIError("Delta Demo client is unavailable")
+            if symbol != "BTCUSD":
+                raise DeltaAPIError("Delta mirror supports BTCUSD Demo only")
+            contract_value = float(self._delta_product.get("contract_value") or 0)
+            contracts = int(round(float(quantity_btc) / contract_value)) if contract_value > 0 else 0
+            if contracts <= 0 or abs(contracts * contract_value - float(quantity_btc)) > 1e-8:
+                raise DeltaAPIError("Paper size cannot be represented as Demo contracts")
+            result = self._delta_client.place_market_order(
+                self._delta_product["id"], "BTCUSD", direction, contracts, client_id)
+            order_id = str((result or {}).get("id") or "") or None
+            state = str((result or {}).get("state") or "").lower()
+            status = "FILLED" if state in {"filled", "closed"} else "SENT"
+            update_open_delta_mirror(pos_id, status, None, order_id, now_ist_str())
+            self._delta_failures = 0
+            log_event("INFO", "delta_mirror", f"Paper trade #{pos_id} mirror {status.lower()}")
+        except Exception as exc:
+            # A timeout may have reached Delta. Look up the deterministic id once;
+            # do not resend the market order.
+            recovered = None
+            if self._delta_client is not None:
+                try:
+                    recovered = self._delta_client.get_order_by_client_order_id(client_id)
+                except Exception:
+                    recovered = None
+            if recovered:
+                update_open_delta_mirror(pos_id, "SENT", "Recovered after ambiguous submission",
+                                         str(recovered.get("id") or "") or None, now_ist_str())
+                self._delta_failures = 0
+                log_event("WARNING", "delta_mirror", f"Paper trade #{pos_id} mirror recovered; no retry sent")
+                return
+            self._record_delta_failure(pos_id, self._safe_delta_reason(exc))
+
     # ------------------------------------------------------------------ #
     # Position management
     # ------------------------------------------------------------------ #
 
     def _manage_positions(self):
         """Check all open positions for SL/TP hits."""
-        if config.get("execution.mode", "paper") == "delta_demo":
+        if False:  # Legacy exchange-authoritative path retired: paper is always the source of truth.
             if self._delta_client and self._delta_product:
                 try:
                     position = self._delta_client.get_position(self._delta_product["id"])
@@ -841,9 +870,17 @@ class PaperEngine:
                                             "protective_tp": local_position.get("tp_price") if local_position.get("entry_config", {}).get("use_take_profit") else None,
                                             "message": sync_message})
                     if size == 0 and local_snapshot:
-                        for stale in local_snapshot:
-                            close_position(stale["id"])
-                        log_event("INFO", "delta_demo", "Exchange position is flat; removed local open-position shadow")
+                        # A flat exchange position can mean that a bracket filled,
+                        # but this project does not yet import the authoritative
+                        # fill/commission history.  Deleting the local shadow
+                        # would silently lose the trade and report false P&L.
+                        self._delta_ready = False
+                        update_exchange_status({"environment": "Delta India Demo/Testnet", "connected": True,
+                            "ready": False, "symbol": "BTCUSD", "position": position,
+                            "open_orders": orders,
+                            "message": "Exchange position is flat; fill-history reconciliation is required before new entries"})
+                        log_event("ERROR", "delta_demo",
+                                  "Exchange position is flat but local trade remains pending fill-history reconciliation")
                     elif size and self._delta_ready:
                         local_positions = local_snapshot
                         if local_positions:
@@ -1070,7 +1107,7 @@ class PaperEngine:
         exit_time = now_ist_str()
 
         # Record in DB (also updates balance and daily stats)
-        delta_order_id = entry_config.get("delta_entry_order_id")
+        delta_order_id = pos.get("delta_order_id") or entry_config.get("delta_entry_order_id")
         execution_venue = entry_config.get(
             "execution_venue", "DELTA_TESTNET" if delta_order_id else "PAPER_ONLY")
         initial_risk = float(pos.get("initial_risk_points") or abs(entry - float(pos.get("initial_sl_price") or sl)))
@@ -1096,6 +1133,9 @@ class PaperEngine:
             execution_venue=execution_venue,
             delta_order_id=delta_order_id,
             target_rrr=target_rrr,
+            delta_status=pos.get("delta_status", "SKIPPED"),
+            delta_reason=pos.get("delta_reason"),
+            delta_updated_at=pos.get("delta_updated_at"),
         )
 
         _excel_exporter.queue_export({
@@ -1117,6 +1157,8 @@ class PaperEngine:
         })
 
         close_position(pos_id)
+        if pos.get("delta_status") in {"SENT", "FILLED"} or delta_order_id:
+            self._mirror_delta_close(pos, trade_id)
 
         emoji = "✅" if net_pnl > 0 else "🛑"
         logger.info(
@@ -1136,6 +1178,29 @@ class PaperEngine:
         log_event("INFO", "engine",
                   f"{direction} closed | {reason} | net P&L=${net_pnl:+.4f} (fee {fee_rate:.4%}/side) | "
                   f"Balance=${state.get('balance', 0):.2f}")
+
+    def _mirror_delta_close(self, pos: dict, trade_id: int) -> None:
+        """Try to flatten an already-mirrored Demo position after the paper exit."""
+        try:
+            if self._delta_client is None or self._delta_product is None:
+                self._connect_delta_demo()
+            if self._delta_client is None or self._delta_product is None:
+                raise DeltaAPIError("Delta Demo client is unavailable")
+            contract_value = float(self._delta_product.get("contract_value") or 0)
+            contracts = int(round(float(pos["quantity"]) / contract_value)) if contract_value > 0 else 0
+            if contracts <= 0:
+                raise DeltaAPIError("Paper size cannot be represented as Demo contracts")
+            result = self._delta_client.close_position_market(
+                self._delta_product["id"], contracts, pos["direction"], f"pc{pos['id']}")
+            update_closed_delta_mirror(trade_id, close_status="SENT",
+                close_order_id=str((result or {}).get("id") or "") or None,
+                close_updated_at=now_ist_str())
+            log_event("INFO", "delta_mirror", f"Paper trade #{pos['id']} Demo close submitted")
+        except Exception as exc:
+            reason = self._safe_delta_reason(exc)
+            update_closed_delta_mirror(trade_id, close_status="FAILED", close_reason=reason,
+                                       close_updated_at=now_ist_str())
+            log_event("WARNING", "delta_mirror", f"Paper trade #{pos['id']} Demo close failed: {reason}")
 
     # ------------------------------------------------------------------ #
     # Stop

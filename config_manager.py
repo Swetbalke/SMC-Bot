@@ -27,6 +27,7 @@ DEFAULTS = {
     },
     "execution": {
         "mode": "paper",
+        "delta_mirror_enabled": False,
         "demo_trading_enabled": False,
         "fee_rate_per_side": 0.0005,
         "slippage_bps": 2.0
@@ -246,6 +247,8 @@ class ConfigManager:
                 errors.append("Execution mode must be paper or delta_demo")
             if not isinstance(data.get("execution", {}).get("demo_trading_enabled", False), bool):
                 errors.append("Demo trading enabled must be true or false")
+            if not isinstance(data.get("execution", {}).get("delta_mirror_enabled", False), bool):
+                errors.append("Delta mirror enabled must be true or false")
             if data.get("execution", {}).get("mode") == "delta_demo" and general.get("symbol") != "BTCUSD":
                 errors.append("Delta Demo execution currently supports BTCUSD only")
             if risk["position_size_mode"] not in {"risk_percent", "fixed_lot"}:

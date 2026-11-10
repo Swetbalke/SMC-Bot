@@ -7,17 +7,17 @@ After=network-online.target smc-engine.service
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/SMC-Bot
+WorkingDirectory=/home/ubuntu/tradingbot
 EnvironmentFile=/etc/smc-trading-bot.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ubuntu/SMC-Bot/deploy/start_dashboard.sh
+ExecStart=/home/ubuntu/tradingbot/deploy/start_dashboard.sh
 Restart=on-failure
 RestartSec=15
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-StandardOutput=append:/home/ubuntu/SMC-Bot/logs/dashboard.log
-StandardError=append:/home/ubuntu/SMC-Bot/logs/dashboard_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

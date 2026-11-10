@@ -9,9 +9,16 @@ __pycache__/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/backups/
+data/backtest_lab.db.lock
 data/engine.lock
 data/config_status.json
 data/trades_export.csv
+data/*.csv
+data/*.xlsx
+data_check_report.txt
+*.tmp
+Desktop.lnk
 logs/*.log
 logs/*.log.*
 trading_bot.log
