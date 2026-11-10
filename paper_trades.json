@@ -1,0 +1,10 @@
+[
+    {
+        "timestamp": "17:32:06",
+        "type": "LONG",
+        "entry_price": 76390.0,
+        "exit_price": 76366.5,
+        "pnl": -23.5,
+        "reason": "SL Hit"
+    }
+]

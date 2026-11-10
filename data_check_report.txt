@@ -1,0 +1,42 @@
+================================================================
+ DELTA INDIA DATA CHECK   2026-11-06 11:13:42 IST
+ (sirf public data -- koi key/login/order nahi)
+================================================================
+
+[PRODUCTION (asli market price)]  https://api.india.delta.exchange
+    Products list : OK (832 ms)  BTC perpetual symbols: BTCUSD
+  Symbol: BTCUSD
+    Live price    : OK (683 ms)  BTCUSD = 75,597.37
+    1m candles    : OK (884 ms)  30 candles, 10:44:00 -> 11:13:00 IST
+                    columns: close, high, low, open, time, volume
+                    last candle ki umar: 44 sec  => CURRENT (chal rahi) candle shamil hai
+                    gaps (missing minutes): 0 | kharab OHLC rows: 0
+                    PC clock vs server: -1.0 sec
+  Symbol: BTCUSDT
+    Live price    : FAIL  (response mein price nahi mila; keys: [])
+    1m candles    : FAIL  (khali list aayi)
+
+[TESTNET / DEMO]  https://cdn-ind.testnet.deltaex.org
+    Products list : OK (1245 ms)  BTC perpetual symbols: BTCUSD
+  Symbol: BTCUSD
+    Live price    : OK (649 ms)  BTCUSD = 75,590.18
+    1m candles    : OK (880 ms)  30 candles, 10:44:00 -> 11:13:00 IST
+                    columns: close, high, low, open, time, volume
+                    last candle ki umar: 49 sec  => CURRENT (chal rahi) candle shamil hai
+                    gaps (missing minutes): 0 | kharab OHLC rows: 0
+                    PC clock vs server: -0.6 sec
+  Symbol: BTCUSDT
+    Live price    : FAIL  (response mein price nahi mila; keys: [])
+    1m candles    : FAIL  (khali list aayi)
+
+================================================================
+ NATIJA
+================================================================
+ OK  : PRODUCTION (asli market price)  symbol=BTCUSD
+ OK  : TESTNET / DEMO  symbol=BTCUSD
+ FAIL: PRODUCTION (asli market price)  symbol=BTCUSDT
+ FAIL: TESTNET / DEMO  symbol=BTCUSDT
+
+ Asli vs Demo price: 75,597.37 vs 75,590.18  (fark -0.01%)
+
+ Is poore output ko ya 'data_check_report.txt' file ko mujhe bhej do.

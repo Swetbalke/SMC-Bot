@@ -1,0 +1,17 @@
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/engine.lock
+data/config_status.json
+data/trades_export.csv
+logs/*.log
+logs/*.log.*
+trading_bot.log

@@ -1,0 +1,18 @@
+{
+    "symbol": "BTCUSD",
+    "timeframe": "1m",
+    "stop_loss_pct": 0.5,
+    "take_profit_pct": 1.5,
+    "trailing_stop_pct": 0.3,
+    "capital": 1000,
+    "leverage": 5,
+    "max_daily_loss": 50,
+    "allow_long": true,
+    "allow_short": true,
+    "use_rsi": false,
+    "use_ema": true,
+    "ema_len": 15,
+    "use_macd": false,
+    "rsi_buy": 10,
+    "rsi_sell": 10
+}
