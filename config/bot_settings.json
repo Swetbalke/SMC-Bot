@@ -7,7 +7,7 @@
     },
     "execution": {
         "mode": "paper",
-        "delta_mirror_enabled": true,
+        "delta_mirror_enabled": false,
         "demo_trading_enabled": false,
         "fee_rate_per_side": 0.0005,
         "slippage_bps": 2.0
